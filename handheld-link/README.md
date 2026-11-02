@@ -81,13 +81,20 @@ screenshots, and USB Link's settings and keys.
 
 ## Speed
 
-Copying runs at about 1.2 MB/s from an RG Nano to a GBA Mini: about 15
-seconds for a 16 MB GBA game, a quarter of an hour for 1 GB. Both handhelds
-get warm during long copies, because the RG Nano's processor is busy the
-whole time. The limit is the Python on the RG Nano that drives the USB side.
-FunKey OS's `adbd` takes 4 KB at a time and acknowledges each piece, and
-Python needs about 3 ms per piece there. Four ADB streams at once (0.3.0)
-didn't change that. A faster link over USB networking is planned.
+From an RG Nano to a GBA Mini, a 405 MB PS1 game copied at **5.3 MB/s**
+(about 80 seconds). A few seconds after the two link, the other handheld
+switches its USB side to a network link, and copies go over that. You see
+the link drop for a moment while it does.
+
+If the network link can't come up, Handheld Link stays on ADB, at about
+1.2 MB/s. That happens when the other handheld is in USB Link's network
+mode, or with `NET=no` in the settings. FunKey OS's `adbd` acknowledges
+every 4 KB, and the RG Nano's processor is busy the whole time on ADB, so
+both handhelds get warm during long copies there.
+
+While the network link is up, the other handheld's USB serial console is
+off (its USB controller can't carry all three). ADB keeps working, and
+the serial console comes back when Handheld Link quits.
 
 ## Settings (optional)
 
@@ -98,6 +105,7 @@ didn't change that. A faster link over USB networking is planned.
 - `ROLE=host` or `ROLE=device`. By default a handheld whose port can be a
   host is the host. **Two RG Nanos:** set `ROLE=device` on the one without
   the OTG adapter (this pairing is untested).
+- `NET=no` keeps the link on ADB and leaves the USB side alone.
 
 ## Troubleshooting
 
@@ -110,6 +118,10 @@ didn't change that. A faster link over USB networking is planned.
 - **"A PC or charger is on the USB port."** The host found power on its own
   port. Unplug the PC or charger and use the OTG adapter.
 - **"The other handheld has another version."** Put the same OPK on both.
+- **Copies run at about 1.2 MB/s, not 5.** The network link didn't come
+  up, so the link stayed on ADB. The host's log says why, in the lines
+  starting with `net:`. A common cause is the other handheld being in USB
+  Link's network mode: switch it back to ADB mode.
 - **The GBA Mini doesn't come back on a PC after unplugging.** Its USB side
   doesn't notice cables coming and going: after an unplug it stays off until
   it is restarted. Handheld Link works around this while it is open
@@ -128,10 +140,19 @@ didn't change that. A faster link over USB networking is planned.
   `adbd`'s `tcp:` service the host opens two connections to the other
   handheld's service: one for its own requests, and one it hands over for
   the other handheld's requests to it. So either side can browse and send.
-- Each connection is four ADB streams carrying one byte stream: piece *n*
-  goes on stream *n* mod 4, and the other end reads them back in order, so
-  files are still written front to back (out-of-order writes are slow on
-  FAT cards).
+- Then the host asks for the **USB network link**. The other handheld
+  rebuilds its USB gadget as ADB + a CDC NCM network function (in place of
+  the serial console). Like USB Link, it stops `adbd`, rebuilds the gadget
+  and starts `adbd` again (`funkey/gadget.sh`), and takes `169.254.217.2`.
+  The host loads USB network drivers built for its kernel (`mii`, `usbnet`,
+  `cdc_ether`, `cdc_ncm`), takes `169.254.217.1`, and moves both
+  connections to TCP. The file service only answers that address over the
+  cable. When the app quits, the other handheld rebuilds FunKey OS's stock
+  gadget. It only does this when its gadget is FunKey OS's stock one.
+- On ADB, each connection is four ADB streams carrying one byte stream:
+  piece *n* goes on stream *n* mod 4, and the other end reads them back in
+  order, so files are still written front to back (out-of-order writes are
+  slow on FAT cards).
 - A file is written to `<name>.hlink-part` and renamed when it is complete,
   with the sender's date. File names from the other side are checked so
   nothing is written outside the folder it belongs in.
@@ -147,8 +168,18 @@ didn't change that. A faster link over USB networking is planned.
 ## Building
 
 ```sh
-handheld-link/funkey/build_opk.sh    # -> handheld-link/funkey/HandheldLink.opk
+handheld-link/funkey/build_net_modules.sh   # the RG Nano's USB network drivers
+handheld-link/funkey/build_opk.sh           # -> handheld-link/funkey/HandheldLink.opk
 ```
+
+`build_net_modules.sh` builds `mii`, `usbnet`, `cdc_ether` and `cdc_ncm`
+for the RG Nano's factory kernel (Linux 4.14.14-funkey). It uses DrUm78's
+kernel source at commit `1f6d3fc` and the factory configuration with only
+these drivers added. It checks the result against the factory options.
+With `--audit <zImage>` it also checks every symbol they import against the
+Nano's own kernel image. The app loads them only into the kernels listed in
+`funkey/kernel/kernels`. The drivers are part of Linux (GPL-2.0); their
+source is that kernel tree.
 
 FunKey OS has no Python, so the OPK brings a Python 3.12 runtime built for
 it (32-bit ARM, musl, about 8 MB in the OPK). The build takes it from

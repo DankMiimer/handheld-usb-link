@@ -9,13 +9,17 @@
 # FunKey OS has no Python, so the OPK brings one: a Python 3.12 runtime built
 # for it (32-bit ARM, musl). HLINK_PY_RUNTIME points at it; by default the one
 # rg-nano-adb-tools' wifi/build_wifi_opk.sh --build-only leaves in
-# ~/.cache/rg-nano-adb-tools/wifi/runtime. Needs mksquashfs and python3.12
-# (the app's .pyc are compiled with it).
+# ~/.cache/rg-nano-adb-tools/wifi/runtime. It also brings the RG Nano's USB
+# network drivers (HLINK_NET_MODULES, from funkey/build_net_modules.sh).
+# Needs mksquashfs and python3.12 (the app's .pyc are compiled with it).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/.."
 OUT="$HERE/HandheldLink.opk"
 RT="${HLINK_PY_RUNTIME:-$HOME/.cache/rg-nano-adb-tools/wifi/runtime}"
+# the RG Nano's USB network drivers, from funkey/build_net_modules.sh; without
+# them the link stays on ADB
+NET="${HLINK_NET_MODULES:-$HOME/.cache/handheld-usb-link/net}"
 PY="$(command -v python3.12 || command -v python3)"
 
 die() { echo "build_opk: $*" >&2; exit 1; }
@@ -34,8 +38,16 @@ cp "$SRC/hlink/"*.py "$STAGE/hlink/"
 "$PY" -m compileall -b -q -d /hlink "$STAGE/hlink" >/dev/null
 rm "$STAGE/hlink/"*.py
 rm -rf "$STAGE/hlink/__pycache__"
-sed 's/\r$//' "$HERE/run.sh" > "$STAGE/run.sh"
-chmod +x "$STAGE/run.sh"
+if [ -f "$NET/cdc_ncm.ko" ] && [ -f "$NET/kernels" ]; then
+  mkdir "$STAGE/net"
+  cp "$NET/"*.ko "$NET/kernels" "$STAGE/net/"
+else
+  echo "build_opk: no USB network drivers in $NET (run funkey/build_net_modules.sh): ADB only" >&2
+fi
+for f in run.sh gadget.sh; do
+  sed 's/\r$//' "$HERE/$f" > "$STAGE/$f"
+  chmod +x "$STAGE/$f"
+done
 "$PY" "$SRC/tools/make_icon.py" "$STAGE/hlink.png"
 cat > "$STAGE/default.funkey-s.desktop" <<EOF
 [Desktop Entry]

@@ -411,6 +411,103 @@ class HostOverAdbTest(unittest.TestCase):
         tmp.cleanup()
 
 
+class NetworkLinkTest(unittest.TestCase):
+    """From ADB to the USB network link: the host asks, the device adds its
+    network function and listens, the host moves both connections to TCP.
+    Loopback addresses stand in for the link's, fakes for the kernel parts."""
+
+    def test_switch_to_the_network_link(self):
+        import time
+        from hlink import usbnet
+
+        class FakeGadget:
+            added = False
+
+            def possible(self):
+                return True
+
+            def on(self):
+                self.added = True
+                return "lo"
+
+            def off(self):
+                self.added = False
+
+        class FakeDrivers:
+            loaded = False
+
+            def possible(self):
+                return True
+
+            def load(self):
+                self.loaded = True
+
+            def interface(self, sysfs):
+                return "lo"
+
+            def unload(self):
+                self.loaded = False
+
+        saved = (usbnet.DEV_IP, usbnet.HOST_IP, usbnet.address, link.REPLUG_WAIT)
+        usbnet.DEV_IP, usbnet.HOST_IP = "127.0.0.2", "127.0.0.1"
+        usbnet.address = lambda name, ip: None
+        link.REPLUG_WAIT = 0.3
+        tmp = tempfile.TemporaryDirectory()
+        big = os.urandom(900 * 1024)
+        make_card(os.path.join(tmp.name, "dev"), {"NES/Dev.nes": b"d"})
+        make_card(os.path.join(tmp.name, "host"), {"NES/Big.nes": big})
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        link.PORT = probe.getsockname()[1]
+        probe.close()
+        logs = []
+        gadget = FakeGadget()
+        dev = link.DeviceManager(Server(FunKeyContent(os.path.join(tmp.name, "dev")),
+                                        hello_info("GBA Mini", "funkey")),
+                                 hello_info("GBA Mini", "funkey"), logs.append, gadget=gadget)
+        dev.start()
+        host_local = LocalSide(FunKeyContent(os.path.join(tmp.name, "host")), "RG Nano")
+        drivers = FakeDrivers()
+        host = link.HostManager(Server(host_local.content, hello_info("RG Nano", "funkey")),
+                                hello_info("RG Nano", "funkey"), logs.append, port=None, net=drivers)
+        usb = {"serial": "gba", "sysfs": "/nowhere"}
+        try:
+            time.sleep(0.3)
+            first = adb.Link(BridgeAdbd())
+            first.connect()
+            host._session(first, usb)               # asks for the network link
+            self.assertTrue(any("asked" in m for m in logs), logs)
+            for _ in range(50):
+                if dev.server.info["net"].get("ip"):
+                    break
+                time.sleep(0.1)
+            self.assertEqual(dev.server.info["net"].get("ip"), "127.0.0.2")
+            self.assertTrue(gadget.added)
+            second = adb.Link(BridgeAdbd())
+            second.connect()
+            t = threading.Thread(target=host._session, args=(second, usb), daemon=True)
+            t.start()
+            for _ in range(100):
+                if host.state.status == link.LINKED and dev.state.status == link.LINKED:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(host.state.status, link.LINKED)
+            self.assertTrue(drivers.loaded)
+            self.assertTrue(any("over the USB network" in m for m in logs), logs)
+            r = copy_items(host_local, host.state.peer, "roms", "nes", [{"id": "Big.nes", "name": "b"}], Answers())
+            self.assertEqual(r["copied"], 1, r)
+            self.assertEqual(read(os.path.join(tmp.name, "dev"), "NES/Big.nes"), big)
+            # and the other way, on the device's own connection
+            self.assertEqual(sorted(i["id"] for i in dev.state.peer.items("roms", "nes")), ["Big.nes"])
+        finally:
+            host.stop()
+            dev.stop()
+            dev.join(3)
+            usbnet.DEV_IP, usbnet.HOST_IP, usbnet.address, link.REPLUG_WAIT = saved
+            tmp.cleanup()
+        self.assertFalse(gadget.added)              # taken out again when the app stops
+
+
 class Writes(bytearray):
     """A stand-in framebuffer that counts the rows written to it."""
 

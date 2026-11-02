@@ -17,7 +17,7 @@ import socket
 import threading
 import time
 
-from . import adb
+from . import adb, usbnet
 from .service import Client, PeerError, RemoteSide, Server
 from .wire import Conn, Striped
 
@@ -26,6 +26,7 @@ STREAMS = int(os.environ.get("HLINK_STREAMS", 4))
 TIMEOUT = 30        # a request with no answer this long: the link is gone
 PING_IDLE = 3       # ping when nothing went over the link this long
 LOOK_FOR = 30       # seconds the port stays a host with nothing plugged in
+REPLUG_WAIT = 5     # seconds for the other handheld to re-plug for the network link
 
 WAITING, LINKED, PROBLEM = "waiting", "linked", "problem"
 
@@ -111,13 +112,61 @@ class Manager(threading.Thread):
 class DeviceManager(Manager):
     """The USB device end: wait for the host to connect through adbd."""
 
-    def __init__(self, server, info, log, rebind=None) -> None:
+    def __init__(self, server, info, log, rebind=None, gadget=None) -> None:
         super().__init__(server, info, log)
         self.rebind = rebind
+        self.gadget = gadget            # usbnet.Gadget: the faster network link
         self.lock = threading.Lock()
         self.groups: dict = {}
+        self.net_busy = threading.Lock()
 
     def run(self) -> None:
+        self.server.info["net"] = {"can": bool(self.gadget and self.gadget.possible())}
+        try:
+            self._run()
+        finally:
+            if self.gadget:
+                self.gadget.off()
+
+    def _net_on(self) -> None:
+        """The host asked for the network link: add it, listen on it."""
+        if not self.net_busy.acquire(blocking=False):
+            return
+        try:
+            time.sleep(0.5)             # let the answer reach the host first
+            name = self.gadget.on()
+            if not name:
+                self.server.info["net"] = {"can": False}
+                return
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                srv.bind((usbnet.DEV_IP, PORT))
+            except OSError as e:
+                self.log("net: can't listen on %s: %s" % (usbnet.DEV_IP, e))
+                self.server.info["net"] = {"can": False}
+                return
+            srv.listen(4)
+            srv.settimeout(1)
+            self.server.info["net"] = {"can": True, "ip": usbnet.DEV_IP}
+            self.log("net: listening on %s:%d (%s)" % (usbnet.DEV_IP, PORT, name))
+        finally:
+            self.net_busy.release()
+        while not self.stopping.is_set():
+            try:
+                sock, peer = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if peer[0] != usbnet.HOST_IP:
+                sock.close()                # only the other end of the cable
+                continue
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            threading.Thread(target=self._accepted, args=(sock,), daemon=True).start()
+        srv.close()
+
+    def _run(self) -> None:
         self.state.set(WAITING, self._waiting_text())
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -138,6 +187,8 @@ class DeviceManager(Manager):
                 udc = now
                 lost = 0.0 if now == "configured" else time.monotonic()
             t = time.monotonic()
+            if self.net_busy.locked():
+                fixed = t               # gadget.sh is rebuilding the gadget: hands off
             if self.rebind and lost and t - lost > 5 and t - fixed > 10:
                 # no host for a while: on handhelds that can't see the cable
                 # (the GBA Mini) only a rebind lets the next host in
@@ -166,6 +217,14 @@ class DeviceManager(Manager):
             first = conn.recv()
         except ConnectionError:
             conn.close()
+            return
+        if first.get("op") == "net_on" and self.gadget and self.server.info["net"].get("can"):
+            try:
+                conn.send({"ok": True})
+            except ConnectionError:
+                pass
+            conn.close()
+            threading.Thread(target=self._net_on, daemon=True).start()
             return
         if first.get("op") != "join":
             self.server.serve(conn, first)      # a plain connection (tests)
@@ -200,7 +259,8 @@ class DeviceManager(Manager):
             for s in socks:
                 s.close()
             return
-        conn = Conn(Striped(socks))
+        # a group of one (over the network link) needs no striping
+        conn = Conn(socks[0]) if of == 1 else Conn(Striped(socks))
         if role == "serve":
             self.server.serve(conn)
             return
@@ -224,12 +284,15 @@ class DeviceManager(Manager):
 class HostManager(Manager):
     """The USB host end: switch the port, find the other handheld, connect."""
 
-    def __init__(self, server, info, log, port) -> None:
+    def __init__(self, server, info, log, port, net=None) -> None:
         super().__init__(server, info, log)
         self.port = port
+        self.net = net                  # usbnet.HostDrivers: the faster network link
         self.want = False               # A pressed: switch the port to host mode
         self.until = 0.0
         self.skip: set[str] = set()     # devices that want authentication
+        self.no_net: set[str] = set()   # devices whose network link failed: ADB only
+        self.replug_until = 0.0         # the other handheld re-plugs its USB side for the network link
         self.wake = threading.Event()
 
     def look_again(self) -> None:
@@ -245,6 +308,8 @@ class HostManager(Manager):
             self.state.set(PROBLEM, "The link part stopped: %s" % e)
         finally:
             self.port.release()
+            if self.net:
+                self.net.unload()
 
     def _idle(self, text: str) -> None:
         if self.state.status == LINKED or self.state.text != text:
@@ -330,10 +395,13 @@ class HostManager(Manager):
             return
         self.log("link: ADB up with %s (%s)" % (dev["serial"] or dev["sysfs"], link.banner))
         try:
-            self._session(link)
+            self._session(link, dev)
         finally:
             link.close()
         self._watch()
+        if time.monotonic() < self.replug_until:
+            self._idle("Switching to the faster USB network link")
+            return
         if not any(d["sysfs"] == dev["sysfs"] for d in adb.find_devices()):
             # unplugged: hand the port back at once, so a PC cable plugged in
             # next never meets this handheld's 5 V
@@ -358,7 +426,64 @@ class HostManager(Manager):
             raise
         return Conn(Striped(socks))
 
-    def _session(self, link: adb.Link) -> None:
+    def _tcp_join(self, ip: str, role: str) -> Conn:
+        sock = socket.create_connection((ip, PORT), 3)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn = Conn(TimedSock(sock))
+        try:
+            conn.send({"op": "join", "group": os.urandom(4).hex(), "index": 0, "of": 1, "role": role})
+            if not conn.recv().get("ok"):
+                raise PeerError("the other handheld refused the network link")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    def _network(self, dev: dict, ip: str):
+        """Both connections over the USB network link, or None (stay on ADB)."""
+        err = self.net.load()
+        if err:
+            self.log("net: drivers did not load: %s" % err)
+            return None
+        name = self.net.interface(dev["sysfs"])
+        if not name:
+            self.log("net: no network interface for the other handheld")
+            return None
+        err = usbnet.address(name, usbnet.HOST_IP)
+        if err:
+            self.log("net: could not address %s: %s" % (name, err))
+            return None
+        end = time.monotonic() + 8
+        while True:
+            try:
+                conn = self._tcp_join(ip, "serve")
+                try:
+                    back = self._tcp_join(ip, "reverse")
+                except BaseException:
+                    conn.close()
+                    raise
+                self.log("net: linked over %s (%s to %s)" % (name, usbnet.HOST_IP, ip))
+                return conn, back
+            except (OSError, ConnectionError, PeerError) as e:
+                if time.monotonic() > end:
+                    self.log("net: no answer on %s: %s" % (ip, e))
+                    return None
+            self.stopping.wait(0.5)
+
+    def _ask_network(self, link: adb.Link) -> bool:
+        """Ask the other handheld to add the network link; it then re-plugs."""
+        try:
+            s = TimedSock(link.open("tcp:%d" % PORT))
+            c = Conn(s)
+            c.send({"op": "net_on"})
+            ok = c.recv().get("ok")
+            c.close()
+            return bool(ok)
+        except (OSError, ConnectionError, PeerError) as e:
+            self.log("net: asking for the network link failed: %s" % e)
+            return False
+
+    def _session(self, link: adb.Link, dev: dict) -> None:
         told = False
         while not self.stopping.is_set():
             if link.dead:
@@ -387,16 +512,48 @@ class HostManager(Manager):
         try:
             client = Client(conn)
             info = client.call("hello", **self.info)
-            back = self._group(link, "reverse")
         except (ConnectionError, PeerError, socket.timeout, OSError) as e:
             self.log("link: hello failed: %s" % e)
             conn.close()
             return
+        via, alive = "ADB", (lambda: not link.dead)
+        net = info.get("net") or {}
+        key = dev["serial"] or dev["sysfs"]
+        if (self.net and net.get("can") and key not in self.no_net
+                and not self.stopping.is_set() and self.net.possible()):
+            if net.get("ip"):
+                pair = self._network(dev, net["ip"])
+                if pair:
+                    conn.close()
+                    conn, back = pair
+                    client = Client(conn)
+                    via, alive = "the USB network", (lambda: True)
+                else:
+                    self.no_net.add(key)
+            elif self._ask_network(link):
+                # it adds the network function and re-plugs its USB side;
+                # the next connection finds it
+                self.log("net: asked %s for the network link" % (info.get("name") or key))
+                self.replug_until = time.monotonic() + 15
+                conn.close()
+                end = time.monotonic() + REPLUG_WAIT
+                while not link.dead and time.monotonic() < end and not self.stopping.is_set():
+                    self.stopping.wait(0.2)     # until it lets go of the USB bus
+                return
+            else:
+                self.no_net.add(key)
+        if via == "ADB":
+            try:
+                back = self._group(link, "reverse")
+            except (ConnectionError, PeerError, socket.timeout, OSError) as e:
+                self.log("link: hello failed: %s" % e)
+                conn.close()
+                return
         self._serve(back)
         name = info.get("name") or "the other handheld"
-        self.log("link: linked with %s (%s)" % (name, info.get("version")))
+        self.log("link: linked with %s (%s) over %s" % (name, info.get("version"), via))
         self.state.set(LINKED, "Linked with %s" % name, RemoteSide(client, name), info)
-        why = self._keepalive(client, lambda: not link.dead)
+        why = self._keepalive(client, alive)
         self.log("link: down: %s" % (link.dead or why))
         client.close()
         back.close()

@@ -22,8 +22,9 @@ Install `HandheldLink-<version>.opk` from the
 into **Applications** on both handhelds, connect them (OTG adapter on the RG
 Nano), and open **Handheld Link** on both. **L / R** switches between the
 two handhelds, **A** marks games, **Start** sends them. If a file is already
-there, it asks what to do. Everything else, including what goes where and
-the speed, is in [handheld-link/README.md](handheld-link/README.md).
+there, it asks what to do. Copies run at about 5 MB/s over a USB network
+link the two set up by themselves. Everything else, including what goes
+where, is in [handheld-link/README.md](handheld-link/README.md).
 
 ## USB Netplay
 

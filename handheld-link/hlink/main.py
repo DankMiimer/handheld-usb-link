@@ -3,6 +3,7 @@
 Settings (environment, or KEY=value lines in /mnt/FunKey/hlink/hlink.conf):
     NAME   what the other handheld calls this one (default: the model)
     ROLE   host or device (default: host if the USB port can be one)
+    NET    no: stay on ADB, never switch to the USB network link
 HLINK_ROOT (the card, /mnt), HLINK_SCREEN (WxH+X+Y), HLINK_FONT and
 HLINK_PORT are for testing.
 """
@@ -15,13 +16,18 @@ import sys
 import threading
 import time
 
-from . import VERSION, funkey
+from . import VERSION, funkey, usbnet
 from .content import FunKeyContent
 from .link import DeviceManager, HostManager
 from .screen import Buttons, Screen
 from .service import LocalSide, Server, hello_info
 
 DATA = os.environ.get("HLINK_DATA", "/mnt/FunKey/hlink")
+OPK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# the USB network drivers the OPK brings (funkey/build_net_modules.sh), and
+# the script that rebuilds the USB gadget with a network function
+NET_DIR = os.environ.get("HLINK_NET_DIR", os.path.join(OPK, "net"))
+GADGET_SH = os.environ.get("HLINK_GADGET_SH", os.path.join(OPK, "gadget.sh"))
 
 
 def settings() -> dict:
@@ -35,7 +41,7 @@ def settings() -> dict:
                     out[k.strip().upper()] = v.strip().strip('"')
     except OSError:
         pass
-    for k in ("NAME", "ROLE"):
+    for k in ("NAME", "ROLE", "NET"):
         if os.environ.get("HLINK_" + k):
             out[k] = os.environ["HLINK_" + k]
     return out
@@ -76,11 +82,14 @@ def main() -> int:
     info = hello_info(name, "funkey")
     server = Server(content, info, log)
     port = None
+    net = conf.get("NET", "yes") != "no"
     if role == "host":
         port = funkey.Port(log)
-        manager = HostManager(server, info, log, port)
+        drivers = usbnet.HostDrivers(NET_DIR, log) if net else None
+        manager = HostManager(server, info, log, port, drivers)
     else:
-        manager = DeviceManager(server, info, log, funkey.rebind_gadget)
+        gadget = usbnet.Gadget(GADGET_SH, log) if net else None
+        manager = DeviceManager(server, info, log, funkey.rebind_gadget, gadget)
     server.note = manager.state.note
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1):
         signal.signal(sig, _quit)
